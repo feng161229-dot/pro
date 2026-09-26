@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI 居家安全監控系統</title>
+<style>
+:root{
+  --bg:#f4f6f9; --card:#ffffff; --text:#2c3e50; --sub:#5b6b7a;
+  --ok:#219150; --danger:#e74c3c; --warn:#e67e22; --border:#e2e6ea;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){--bg:#14181d;--card:#1e242b;--text:#eef1f4;--sub:#9aa7b2;--border:#30363d;}
+}
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;max-width:820px;margin:0 auto;padding:16px 16px calc(16px + env(safe-area-inset-bottom,0px));background:var(--bg);color:var(--text)}
+h1{text-align:center;font-size:1.3rem;margin:10px 0 16px}
+.card{background:var(--card);padding:18px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,.08);margin-bottom:16px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;margin-bottom:12px}
+input[type=password]{padding:9px;width:250px;max-width:100%;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text)}
+input[type=range]{width:140px}
+button{padding:9px 16px;background:var(--ok);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold}
+button.stop{background:var(--danger)}
+button:disabled{background:#95a5a6;cursor:not-allowed}
+.video-wrap{position:relative;max-width:640px;margin:10px auto;text-align:center}
+video,canvas{width:100%;max-width:640px;border-radius:8px;border:2px solid var(--border);background:#000}
+canvas{display:none}
+#status{text-align:center;font-weight:bold;margin-top:10px}
+.pill{display:inline-block;font-size:.8rem;padding:2px 8px;border-radius:10px;background:var(--border);color:var(--sub);margin-left:6px}
+#log{width:100%;height:150px;background:#0f1115;color:#4ade80;font-family:Consolas,monospace;font-size:12.5px;padding:10px;border-radius:6px;overflow-y:auto;white-space:pre-wrap}
+.note{font-size:.82rem;color:var(--sub);line-height:1.5;margin-top:6px}
+label{font-size:.9rem}
+</style>
+</head>
+<body>
+<h1>🏠 AI 居家安全監控系統<span class="pill">邊緣預判 + 雲端 Gemini 分析</span></h1>
+
+<div class="card">
+  <div class="controls">
+    <label>Gemini API Key：<input type="password" id="apiKey" placeholder="貼上 Google Gemini API 金鑰"></label>
+  </div>
+  <div class="controls">
+    <label>移動靈敏度：<input type="range" id="sensitivity" min="1" max="10" value="4"></label>
+    <label>雲端分析最短間隔(秒)：<input type="number" id="cooldown" value="6" min="2" max="60" style="width:60px"></label>
+  </div>
+  <div class="controls">
+    <button id="startBtn">啟動監控</button>
+    <button id="stopBtn" class="stop" disabled>停止監控</button>
+  </div>
+  <div id="status">系統狀態：待命</div>
+  <div class="video-wrap">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="snap"></canvas>
+    <canvas id="prev" style="display:none"></canvas>
+  </div>
+  <p class="note">運作方式：瀏覽器端每 500ms 用畫面差異偵測「移動幅度」作為邊緣端前處理（免付費、零延遲），只有偵測到明顯移動、且超過設定的冷卻時間時，才擷取畫面送往 Gemini 雲端做跌倒／倒地／火災辨識，藉此降低頻寬與 API 用量。</p>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">AI 辨識日誌</h3>
+  <div id="log"></div>
+</div>
+
+<script>
+const video=document.getElementById('webcam'),snap=document.getElementById('snap'),prev=document.getElementById('prev');
+const startBtn=document.getElementById('startBtn'),stopBtn=document.getElementById('stopBtn');
+const apiKeyInput=document.getElementById('apiKey'),statusEl=document.getElementById('status'),logEl=document.getElementById('log');
+const sensEl=document.getElementById('sensitivity'),cdEl=document.getElementById('cooldown');
+let stream=null,motionTimer=null,lastCloudCall=0,isAnalyzing=false,hasPrevFrame=false;
+
+function log(msg){
+  const t=new Date().toLocaleTimeString();
+  logEl.textContent=`[${t}] ${msg}\n`+logEl.textContent;
+}
+
+async function startCamera(){
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+    video.srcObject=stream;
+    return true;
+  }catch(e){alert('無法存取攝影機：'+e.message);return false;}
+}
+
+function grab(canvas){
+  const ctx=canvas.getContext('2d');
+  canvas.width=video.videoWidth||640; canvas.height=video.videoHeight||480;
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  return ctx;
+}
+
+// 邊緣端前處理：比較連續兩張畫面的灰階差異，估計移動幅度
+function detectMotion(){
+  const curCtx=grab(snap);
+  const cur=curCtx.getImageData(0,0,snap.width,snap.height).data;
+  if(!hasPrevFrame){
+    prev.width=snap.width; prev.height=snap.height;
+    prev.getContext('2d').drawImage(snap,0,0);
+    hasPrevFrame=true; return 0;
+  }
+  const prevData=prev.getContext('2d').getImageData(0,0,prev.width,prev.height).data;
+  let diff=0,sampleStep=16; // 取樣以加快運算
+  for(let i=0;i<cur.length;i+=4*sampleStep){
+    const d=Math.abs(cur[i]-prevData[i])+Math.abs(cur[i+1]-prevData[i+1])+Math.abs(cur[i+2]-prevData[i+2]);
+    if(d>60) diff++;
+  }
+  prev.getContext('2d').drawImage(snap,0,0);
+  return diff;
+}
+
+function b64FromSnap(){
+  return snap.toDataURL('image/jpeg',0.7).split(',')[1];
+}
+
+async function analyzeWithGemini(base64Image,apiKey){
+  const endpoint=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const prompt=`你是一位專業的 AI 視覺安全監控專家。請仔細分析這張居家影像，判定是否出現：
+1. 有人心悸、頭昏、倒地、摔倒、跌倒或痛苦掙扎。
+2. 有火燒、火災或冒煙現象。
+請嚴格按照以下格式回應：
+【狀態】危險 / 安全
+【類型】[具體種類，如：跌倒、倒地、火災；若無則寫「無」]
+【詳細描述】[簡短描述人物動作或環境狀況]`;
+  const payload={contents:[{parts:[{text:prompt},{inline_data:{mime_type:"image/jpeg",data:base64Image}}]}]};
+  const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!res.ok){
+    const errText=await res.text().catch(()=>'');
+    throw new Error(`HTTP ${res.status} ${errText.slice(0,150)}`);
+  }
+  const data=await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '（無回應內容）';
+}
+
+async function runCloudAnalysis(){
+  if(isAnalyzing) return;
+  isAnalyzing=true;
+  statusEl.textContent='狀態：偵測到移動，Gemini 雲端分析中...';
+  try{
+    const apiKey=apiKeyInput.value.trim();
+    if(!apiKey) throw new Error('尚未輸入 API Key');
+    const result=await analyzeWithGemini(b64FromSnap(),apiKey);
+    log('Gemini 分析結果：\n'+result.trim());
+    const danger=/【狀態】危險|跌倒|倒地|摔倒|火災|火燒/.test(result);
+    if(danger){
+      statusEl.textContent='⚠️ 警告！偵測到居家意外事件！';
+      statusEl.style.color='var(--danger)';
+      alert(`🚨【AI 居家安全緊急警告】🚨\n\n${result.trim()}`);
+    }else{
+      statusEl.textContent='狀態：環境安全監控中';
+      statusEl.style.color='var(--ok)';
+    }
+  }catch(e){
+    log('分析錯誤：'+e.message);
+    statusEl.textContent='狀態：分析發生錯誤';
+    statusEl.style.color='var(--warn)';
+  }finally{
+    isAnalyzing=false;
+    lastCloudCall=Date.now();
+  }
+}
+
+function motionLoop(){
+  const diffCount=detectMotion();
+  const threshold=(11-parseInt(sensEl.value,10))*40; // 靈敏度越高，門檻越低
+  const cooldownMs=parseInt(cdEl.value,10)*1000;
+  if(diffCount>threshold && Date.now()-lastCloudCall>cooldownMs){
+    log(`邊緣端偵測到移動 (差異度 ${diffCount})，觸發雲端分析`);
+    runCloudAnalysis();
+  }
+}
+
+startBtn.addEventListener('click',async()=>{
+  if(!apiKeyInput.value.trim()){alert('請先輸入 Google Gemini API Key！');return;}
+  if(!(await startCamera())) return;
+  startBtn.disabled=true; stopBtn.disabled=false; apiKeyInput.disabled=true;
+  hasPrevFrame=false; lastCloudCall=0;
+  statusEl.textContent='狀態：監控系統已啟動（邊緣移動偵測中）';
+  statusEl.style.color='var(--ok)';
+  log('系統啟動：邊緣端每 500ms 進行移動偵測，觸發時才呼叫雲端 Gemini 分析。');
+  motionTimer=setInterval(motionLoop,500);
+});
+
+stopBtn.addEventListener('click',()=>{
+  if(motionTimer) clearInterval(motionTimer);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  startBtn.disabled=false; stopBtn.disabled=true; apiKeyInput.disabled=false;
+  statusEl.textContent='狀態：監控已停止'; statusEl.style.color='var(--text)';
+  log('系統已停止監控。');
+});
+</script>
+</body>
+</html>
