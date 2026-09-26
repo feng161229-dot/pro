@@ -86,8 +86,9 @@
 
         // 3. 傳送至 Google Gemini API 進行 AI 視覺分析
         async function analyzeWithGemini(base64Image, apiKey) {
+            const cleanApiKey = apiKey.trim();
              // 使用 gemini-1.5-flash 模型端點
-            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${cleanApiKey}`;
            // const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
 
             
