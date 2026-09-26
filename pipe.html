@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MediaPipe Pose 跌倒偵測</title>
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--text:#2c3e50;--sub:#5b6b7a;--ok:#219150;--danger:#e74c3c;--border:#e2e6ea;}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#14181d;--card:#1e242b;--text:#eef1f4;--sub:#9aa7b2;--border:#30363d;}}
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;max-width:820px;margin:0 auto;padding:16px;background:var(--bg);color:var(--text)}
+h1{text-align:center;font-size:1.25rem}
+.card{background:var(--card);padding:16px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,.08);margin-bottom:16px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center;margin-bottom:10px}
+button{padding:9px 16px;background:var(--ok);color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer}
+button.stop{background:var(--danger)}
+button:disabled{background:#95a5a6}
+.stage{position:relative;max-width:640px;margin:0 auto}
+video,canvas{width:100%;border-radius:8px;background:#000}
+canvas{position:absolute;top:0;left:0}
+.metrics{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-top:10px;font-size:.9rem}
+.metrics b{color:var(--sub);font-weight:normal}
+#status{text-align:center;font-weight:bold;margin-top:8px}
+#log{width:100%;height:130px;background:#0f1115;color:#4ade80;font-family:Consolas,monospace;font-size:12px;padding:10px;border-radius:6px;overflow-y:auto;white-space:pre-wrap}
+.note{font-size:.8rem;color:var(--sub);line-height:1.5}
+label{font-size:.85rem}
+input[type=range]{width:120px}
+</style>
+</head>
+<body>
+<h1>🧍‍♂️ MediaPipe Pose 跌倒偵測（33 骨架關鍵點）</h1>
+
+<div class="card">
+  <div class="controls">
+    <label>傾角門檻(°)：<input id="angleTh" type="range" min="30" max="80" value="55"><span id="angleThV">55</span></label>
+    <label>下墜速度門檻：<input id="velTh" type="range" min="10" max="90" value="40"><span id="velThV">40</span></label>
+  </div>
+  <div class="controls">
+    <button id="startBtn">啟動偵測</button>
+    <button id="stopBtn" class="stop" disabled>停止</button>
+  </div>
+  <div id="status">狀態：待命</div>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div class="metrics">
+    <span><b>身體傾角：</b><span id="angleVal">--</span>°</span>
+    <span><b>垂直下墜速度：</b><span id="velVal">--</span></span>
+    <span><b>骨架偵測：</b><span id="poseState">未偵測到人</span></span>
+  </div>
+  <p class="note">原理：以左右肩中點→左右髖中點的向量對「垂直方向」計算夾角，站立時接近 0°，倒地時接近 90°。同時追蹤髖部中點在畫面 Y 軸的位移速度，偵測「傾角過大」且「短時間內快速下墜」同時發生時才判定為跌倒，降低誤判（例如彎腰、坐下）。</p>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">事件日誌</h3>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video=document.getElementById('video'),canvas=document.getElementById('overlay'),ctx=canvas.getContext('2d');
+const startBtn=document.getElementById('startBtn'),stopBtn=document.getElementById('stopBtn');
+const statusEl=document.getElementById('status'),logEl=document.getElementById('log'),poseStateEl=document.getElementById('poseState');
+const angleValEl=document.getElementById('angleVal'),velValEl=document.getElementById('velVal');
+const angleTh=document.getElementById('angleTh'),velTh=document.getElementById('velTh');
+angleTh.oninput=()=>document.getElementById('angleThV').textContent=angleTh.value;
+velTh.oninput=()=>document.getElementById('velThV').textContent=velTh.value;
+
+let poseLandmarker=null,drawUtils=null,running=false,stream=null,rafId=null;
+let hipHistory=[]; // {t, y}
+let highAngleSince=null, lastAlert=0;
+
+function log(msg){const t=new Date().toLocaleTimeString();logEl.textContent=`[${t}] ${msg}\n`+logEl.textContent;}
+
+async function initModel(){
+  statusEl.textContent='狀態：載入 MediaPipe Pose 模型中...';
+  const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  poseLandmarker=await PoseLandmarker.createFromOptions(vision,{
+    baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",delegate:"GPU"},
+    runningMode:"VIDEO", numPoses:1
+  });
+  drawUtils=new DrawingUtils(ctx);
+  log('MediaPipe Pose Lite 模型載入完成。');
+}
+
+async function startCamera(){
+  stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+  video.srcObject=stream;
+  await new Promise(r=>video.onloadedmetadata=r);
+  canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+}
+
+function angleFromVertical(shoulderMid,hipMid){
+  const dx=hipMid.x-shoulderMid.x, dy=hipMid.y-shoulderMid.y;
+  const mag=Math.hypot(dx,dy)||1e-6;
+  const cos=dy/mag; // vertical ref = (0,1)
+  const deg=Math.acos(Math.max(-1,Math.min(1,cos)))*180/Math.PI;
+  return deg;
+}
+
+function updateVelocity(hipY,now){
+  hipHistory.push({t:now,y:hipY});
+  hipHistory=hipHistory.filter(p=>now-p.t<800); // 近 0.8 秒視窗
+  if(hipHistory.length<2) return 0;
+  const first=hipHistory[0], last=hipHistory[hipHistory.length-1];
+  const dt=(last.t-first.t)/1000;
+  if(dt<=0) return 0;
+  return ((last.y-first.y)/dt)*100; // 放大成好讀的單位
+}
+
+function triggerFallAlert(angle,vel){
+  if(Date.now()-lastAlert<8000) return; // 8秒內不重複警告
+  lastAlert=Date.now();
+  statusEl.textContent='⚠️ 警告！偵測到疑似跌倒！'; statusEl.style.color='var(--danger)';
+  log(`偵測到跌倒：傾角 ${angle.toFixed(1)}°，下墜速度 ${vel.toFixed(1)}`);
+  alert(`🚨 偵測到疑似跌倒事件！\n身體傾角：${angle.toFixed(1)}°\n下墜速度指標：${vel.toFixed(1)}`);
+}
+
+function loop(){
+  if(!running) return;
+  const now=performance.now();
+  const result=poseLandmarker.detectForVideo(video,now);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(result.landmarks && result.landmarks.length>0){
+    const lm=result.landmarks[0];
+    poseStateEl.textContent='偵測到人體';
+    drawUtils.drawLandmarks(lm,{radius:3});
+    drawUtils.drawConnectors(lm,PoseLandmarker.POSE_CONNECTIONS);
+
+    const ls=lm[11], rs=lm[12], lh=lm[23], rh=lm[24];
+    const shoulderMid={x:(ls.x+rs.x)/2,y:(ls.y+rs.y)/2};
+    const hipMid={x:(lh.x+rh.x)/2,y:(lh.y+rh.y)/2};
+    const angle=angleFromVertical(shoulderMid,hipMid);
+    const vel=updateVelocity(hipMid.y,now);
+
+    angleValEl.textContent=angle.toFixed(1);
+    velValEl.textContent=vel.toFixed(1);
+
+    const aTh=parseFloat(angleTh.value), vTh=parseFloat(velTh.value);
+    if(angle>aTh){
+      if(highAngleSince===null) highAngleSince=now;
+      const sustained=now-highAngleSince>400; // 持續 0.4 秒以上才算，濾掉瞬間雜訊
+      if(sustained && vel>vTh){
+        triggerFallAlert(angle,vel);
+      }else if(sustained && Date.now()-lastAlert>8000){
+        statusEl.textContent='狀態：姿態異常（傾角過大，觀察中）'; statusEl.style.color='#e67e22';
+      }
+    }else{
+      highAngleSince=null;
+      if(Date.now()-lastAlert>1500){statusEl.textContent='狀態：監控中，姿態正常';statusEl.style.color='var(--ok)';}
+    }
+  }else{
+    poseStateEl.textContent='未偵測到人';
+  }
+  rafId=requestAnimationFrame(loop);
+}
+
+startBtn.onclick=async()=>{
+  startBtn.disabled=true;
+  try{
+    if(!poseLandmarker) await initModel();
+    await startCamera();
+    running=true; stopBtn.disabled=false;
+    statusEl.textContent='狀態：監控中'; statusEl.style.color='var(--ok)';
+    log('系統啟動，開始以 MediaPipe Pose 追蹤骨架關鍵點。');
+    loop();
+  }catch(e){
+    log('啟動失敗：'+e.message);
+    statusEl.textContent='狀態：啟動失敗（見日誌）'; startBtn.disabled=false;
+  }
+};
+
+stopBtn.onclick=()=>{
+  running=false;
+  if(rafId) cancelAnimationFrame(rafId);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  startBtn.disabled=false; stopBtn.disabled=true;
+  statusEl.textContent='狀態：已停止'; statusEl.style.color='var(--text)';
+  log('系統已停止。');
+};
+</script>
+</body>
+</html>
