@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI居家安全即時視覺監控系統</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; background-color: #f4f6f9; color: #333; }
+        h1 { color: #2c3e50; text-align: center; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); margin-bottom: 20px; }
+        .video-container { position: relative; width: 100%; max-width: 640px; margin: 15px auto; text-align: center; }
+        video, canvas { width: 100%; max-width: 640px; height: auto; border-radius: 8px; border: 2px solid #ddd; background: #000; }
+        .controls { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; justify-content: center; flex-wrap: wrap; }
+        input[type="password"] { padding: 10px; width: 280px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+        button { padding: 10px 18px; background-color: #27ae60; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; transition: 0.2s; }
+        button:hover { background-color: #219150; }
+        button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
+        button.stop { background-color: #e74c3c; }
+        button.stop:hover { background-color: #c0392b; }
+        #status { font-size: 16px; font-weight: bold; margin-top: 10px; text-align: center; color: #34495e; }
+        #log { width: 100%; height: 140px; background: #1e1e1e; color: #00ff00; font-family: Consolas, monospace; padding: 10px; border-radius: 6px; box-sizing: border-box; overflow-y: scroll; font-size: 13px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>AI 居家安全即時視覺監控系統</h1>
+    
+    <div class="card">
+        <div class="controls">
+            <label for="apiKey"><strong>Gemini API Key：</strong></label>
+            <input type="password" id="apiKey" placeholder="請貼上 Google Gemini API 金鑰">
+            <button id="startBtn">啟動 AI 監控</button>
+            <button id="stopBtn" class="stop" disabled>停止監控</button>
+        </div>
+        <div id="status">系統狀態：待命</div>
+        
+        <div class="video-container">
+            <video id="webcam" autoplay playsinline muted></video>
+            <canvas id="snapshot" style="display: none;"></canvas>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>AI 辨識與分析日誌</h3>
+        <textarea id="log" readonly placeholder="日誌將顯示於此..."></textarea>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('snapshot');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const apiKeyInput = document.getElementById('apiKey');
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+
+        let stream = null;
+        let timer = null;
+        let isAnalyzing = false;
+
+        function logMessage(msg) {
+            const time = new Date().toLocaleTimeString();
+            logEl.value = `[${time}] ${msg}\n` + logEl.value;
+        }
+
+        // 1. 啟動 WebCam 鏡頭擷取影像串流
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                video.srcObject = stream;
+                return true;
+            } catch (err) {
+                alert('無法存取 WebCam 攝影機：' + err.message);
+                return false;
+            }
+        }
+
+        // 2. 擷取即時畫面幀並轉為 Base64 編碼
+        function captureFrameBase64() {
+            const context = canvas.getContext('2d');
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+            return dataUrl.split(',')[1]; // 取得 pure base64 數據
+        }
+
+        // 3. 傳送至 Google Gemini API 進行 AI 視覺分析
+        async function analyzeWithGemini(base64Image, apiKey) {
+             // 使用 gemini-1.5-flash 模型端點
+           // const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
+
+            
+            // 依據居家安全需求設定 Prompt
+            const systemPrompt = `你是一位專業的 AI 視覺安全監控專家。請仔細分析這張居家影像。
+請判定畫面中是否出現以下任一異常危險狀況：
+1. 有人心悸、頭昏、倒地、摔倒、跌倒或痛苦掙扎。
+2. 有火燒、火災或冒煙現象。
+
+請嚴格按照以下格式回應：
+【狀態】危險 / 安全
+【類型】[寫出具體種類，例如：跌倒、倒地、火災，若無則寫「無」]
+【詳細描述】[簡短描述人物動作、性別/特徵或環境狀況]`;
+
+            const payload = {
+                contents: [{
+                    parts: [
+                        { text: systemPrompt },
+                        { inline_data: { mime_type: "image/jpeg", data: base64Image } }
+                    ]
+                }]
+            };
+
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                throw new Error(`Gemini API 請求失敗 (HTTP ${response.status})`);
+            }
+
+            const data = await response.json();
+            return data.candidates[0].content.parts[0].text;
+            //return data.candidates.content.parts.text;
+
+        }
+
+        // 4. 定期執行的 AI 視覺辨識流程
+        async function runVisionInspection() {
+            if (isAnalyzing) return;
+            isAnalyzing = true;
+            statusEl.innerText = "狀態：擷取影像中，由 Gemini API 分析中...";
+
+            try {
+                const base64Image = captureFrameBase64();
+                const apiKey = apiKeyInput.value.trim();
+                const analysisResult = await analyzeWithGemini(base64Image, apiKey);
+                
+                logMessage("Gemini 分析結果：\n" + analysisResult.trim());
+
+                // 判斷是否涵蓋跌倒、倒地、摔倒、火災等危險關鍵字
+                const isDanger = analysisResult.includes("【狀態】危險") || 
+                                 analysisResult.includes("跌倒") || 
+                                 analysisResult.includes("倒地") || 
+                                 analysisResult.includes("摔倒") || 
+                                 analysisResult.includes("火災") || 
+                                 analysisResult.includes("火燒");
+
+                if (isDanger) {
+                    statusEl.innerText = "⚠️ 警告！偵測到居家意外事件！";
+                    statusEl.style.color = "#e74c3c";
+                    
+                    // 彈出訊息警告框
+                    alert(`🚨 【AI 居家安全緊急警告】 🚨\n\n系統偵測到高風險事件：\n\n${analysisResult.trim()}`);
+                } else {
+                    statusEl.innerText = "狀態：環境安全監控中";
+                    statusEl.style.color = "#27ae60";
+                }
+            } catch (err) {
+                logMessage("分析錯誤：" + err.message);
+                statusEl.innerText = "狀態：分析過程中發生錯誤";
+                statusEl.style.color = "#e67e22";
+            } finally {
+                isAnalyzing = false;
+            }
+        }
+
+        // 啟動監控按鈕事件
+        startBtn.addEventListener('click', async () => {
+            const apiKey = apiKeyInput.value.trim();
+            if (!apiKey) {
+                alert('請先輸入有效的 Google Gemini API Key！');
+                return;
+            }
+
+            const isCameraReady = await startCamera();
+            if (isCameraReady) {
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                apiKeyInput.disabled = true;
+                statusEl.innerText = "狀態：監控系統已啟動";
+                logMessage("系統啟動：開始透過 WebCam 定期拍攝並分析畫面。");
+
+                // 設定每 8 秒發送一次影像進行辨識（可依需求調整頻率）
+                timer = setInterval(runVisionInspection, 8000);
+                runVisionInspection();
+            }
+        });
+
+        // 停止監控按鈕事件
+        stopBtn.addEventListener('click', () => {
+            if (timer) clearInterval(timer);
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            apiKeyInput.disabled = false;
+            statusEl.innerText = "狀態：監控已停止";
+            statusEl.style.color = "#34495e";
+            logMessage("系統已停止監控。");
+        });
+    </script>
+</body>
+</html>
